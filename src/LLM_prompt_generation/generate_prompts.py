@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+import os
+import json
+import argparse
+import base64
+from datetime import datetime
+import random
+from pathlib import Path
+import pandas as pd
+import math
+
+
+def load_metadata_questions(metadata_path, video_id):
+    """Load questions for a specific video from the metadata parquet file."""
+    try:
+        df = pd.read_parquet(metadata_path)
+        video_questions = df[df['video_id'] == video_id]['question'].tolist()
+        return video_questions
+    except Exception as e:
+        print(
+            f"Error loading questions from metadata for video {video_id}: {e}")
+        return []
+
+
+def load_tracking_results(file_path):
+    """Load tracking results from a JSON file."""
+    with open(file_path, 'r') as f:
+        tracking_data = json.load(f)
+    return tracking_data
+
+
+def load_yolo_results(file_path):
+    """Load YOLOv10 detection results from a JSON file."""
+    with open(file_path, 'r') as f:
+        yolo_data = json.load(f)
+    return yolo_data
+
+
+def encode_image_to_base64(image_path):
+    """Encode an image file to base64 for inclusion in the prompt."""
+    with open(image_path, 'rb') as image_file:
+        return base64.b64encode(image_file.read()).decode('utf-8')
+
+
+def get_tracking_visualizations(vis_dir, video_id):
+    """Get all visualization images (excluding MP4 files) for a video."""
+    video_vis_dir = os.path.join(vis_dir, video_id)
+    if not os.path.exists(video_vis_dir):
+        return []
+
+    # Get all visualization files, excluding .mp4 files
+    vis_files = [os.path.join(video_vis_dir, f) for f in os.listdir(video_vis_dir)
+                 if f.endswith(('.png', '.jpg', '.jpeg')) and not f.endswith('.mp4')]
+
+    return vis_files
+
+
+def get_yolo_detection_samples(yolo_dir, video_id, sample_fraction=0.2):
+    """Get a subset (1/5th) of YOLOv10 detection images, evenly spaced."""
+    detection_dir = os.path.join(yolo_dir, video_id, "detections")
+    if not os.path.exists(detection_dir):
+        return []
+
+    # Get all detection image files
+    detection_files = [f for f in os.listdir(detection_dir)
+                       if f.startswith(f"{video_id}_detection_") and f.endswith(('.jpg', '.jpeg', '.png'))]
+
+    # Sort by frame number
+    detection_files.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
+
+    # Calculate how many images to sample
+    total_images = len(detection_files)
+    sample_count = max(1, math.ceil(total_images * sample_fraction))
+
+    # Select evenly spaced images
+    if sample_count >= total_images:
+        selected_detections = detection_files
+    else:
+        # Evenly sample frames across all detections
+        step = total_images / sample_count
+        indices = [int(i * step) for i in range(sample_count)]
+        selected_detections = [detection_files[i] for i in indices]
+
+    # Return full paths
+    return [os.path.join(detection_dir, f) for f in selected_detections]
+
+
+def generate_prompt(vis_paths, detection_paths, tracking_data, yolo_data, questions, num_questions=3, format_type="ollama"):
+    """Generate a complete prompt for the LLM including visualizations, detection images, tracking data, and questions."""
+    # Default system prompt embedded in the code
+    system_prompt = """You are a specialized video scene analyst tasked with answering questions about what happens in short videos. You will analyze:
+
+1. TRACKING DATA: Contains information about objects in the scene including:
+   - Object IDs and classifications
+   - Duration objects appear in the video
+   - Position and movement trajectories
+   - Interactions between different objects
+
+2. VISUAL EVIDENCE: You'll receive sample frames from the video, including:
+   - Tracking visualizations showing object paths and movements over time
+   - Detection images highlighting identified objects with bounding boxes
+
+When answering questions about the video content:
+
+- Integrate information from both tracking data and visual evidence
+- Reference specific evidence from the tracking data (object IDs, trajectories, timings)
+- Describe what you observe in the sample images (object positions, actions, interactions)
+- Identify key events and timeline of actions in the scene
+- Provide concrete, data-supported observations rather than speculations
+- Be precise about quantities, positions, and object classifications
+- Consider temporal aspects - the sequence of events that occurred
+- Focus on the most relevant information to directly answer each question
+
+If tracking data and visual evidence appear inconsistent, acknowledge the discrepancy and explain your reasoning for preferring one source over another."""
+
+    # Encode the visualization images to base64
+    encoded_vis = []
+    for vis_path in vis_paths:
+        try:
+            encoded_vis.append({
+                "path": vis_path,
+                "base64": encode_image_to_base64(vis_path),
+                "type": "visualization"
+            })
+        except Exception as e:
+            print(f"Error encoding visualization {vis_path}: {e}")
+
+    # Encode the detection images to base64
+    encoded_detections = []
+    for detection_path in detection_paths:
+        try:
+            encoded_detections.append({
+                "path": detection_path,
+                "base64": encode_image_to_base64(detection_path),
+                "type": "detection"
+            })
+        except Exception as e:
+            print(f"Error encoding detection {detection_path}: {e}")
+
+    # Combine all images with their type
+    all_images = encoded_vis + encoded_detections
+
+    if not all_images:
+        print("No images could be encoded. Cannot generate prompt.")
+        return None
+
+    # Select a random subset of questions if we have more than requested
+    if len(questions) > num_questions:
+        selected_questions = random.sample(questions, num_questions)
+    else:
+        selected_questions = questions
+
+    # Questions as formatted text
+    questions_text = "\n".join(
+        [f"{i+1}. {q}" for i, q in enumerate(selected_questions)])
+
+    # Prepare detection data for the prompt
+    tracking_info = json.dumps(tracking_data, indent=2)
+    yolo_info = json.dumps(yolo_data, indent=2)
+
+    # User message text that includes tracking data, YOLOv10 data, and descriptions of the images
+    user_message_text = f"""I'm providing you with tracking data, object detection results, and visualizations for a traffic video.
+
+The visualizations include:
+{', '.join([os.path.basename(img['path']) for img in encoded_vis])}
+
+The object detection images include:
+{', '.join([os.path.basename(img['path']) for img in encoded_detections])}
+
+Tracking data:
+{tracking_info}
+
+YOLOv10 detection data:
+{yolo_info}
+
+Please analyze all provided images and data to answer the following questions:
+{questions_text}"""
+
+    # Format based on the model type
+    if format_type == "anthropic":
+        # Claude-style prompt
+        content_items = []
+
+        # Add all images first
+        for img in all_images:
+            content_items.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": img["base64"]
+                }
+            })
+
+        # Add the text after all images
+        content_items.append({
+            "type": "text",
+            "text": user_message_text
+        })
+
+        complete_prompt = [
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role": "user",
+                "content": content_items
+            }
+        ]
+
+    elif format_type == "openai":
+        # OpenAI-style prompt
+        content_items = [{"type": "text", "text": user_message_text}]
+
+        for img in all_images:
+            content_items.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{img['base64']}"
+                }
+            })
+
+        complete_prompt = [
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role": "user",
+                "content": content_items
+            }
+        ]
+
+    elif format_type == "ollama":
+        # Ollama-style prompt (JSON format)
+        images = [
+            f"data:image/jpeg;base64,{img['base64']}" for img in all_images]
+
+        complete_prompt = {
+            "model": "llava",  # This will be overridden by the actual model name
+            "prompt": f"{system_prompt}\n\n{user_message_text}",
+            "images": images,
+            "stream": False
+        }
+
+    elif format_type == "lmstudio":
+        # LM Studio style prompt - combine all images into one message
+        image_tags = "\n".join(
+            [f"<img src='data:image/jpeg;base64,{img['base64']}'>" for img in all_images])
+
+        complete_prompt = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": f"{image_tags}\n\n{user_message_text}"
+                }
+            ],
+            "temperature": 0.7,
+            "max_tokens": 1024,
+            "stream": False
+        }
+
+    else:
+        # Generic format for other local LLMs
+        complete_prompt = {
+            "system_prompt": system_prompt,
+            "user_message": user_message_text,
+            "image_base64": [img["base64"] for img in all_images],
+            "questions": selected_questions
+        }
+
+    return {
+        "prompt": complete_prompt,
+        "format_type": format_type,
+        "questions": selected_questions,
+        "visualization_paths": vis_paths,
+        "detection_paths": detection_paths,
+        "tracking_data": tracking_data,
+        "yolo_data": yolo_data
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Generate prompts for the LLM from tracking data, visualizations, and detection images.')
+    parser.add_argument('--vis_dir', type=str, default='dataset/tracking_visualizations',
+                        help='Directory containing tracking visualization images')
+    parser.add_argument('--tracking_dir', type=str, default='dataset/tracking_results',
+                        help='Directory containing tracking result JSON files')
+    parser.add_argument('--yolo_dir', type=str, default='dataset/yolov10_results',
+                        help='Directory containing YOLOv10 detection result JSON files')
+    parser.add_argument('--metadata_file', type=str, default='dataset/metadata.parquet',
+                        help='Parquet file containing video metadata with questions')
+    parser.add_argument('--output_dir', type=str, default='output/prompts',
+                        help='Directory to save the generated prompts')
+    parser.add_argument('--num_questions', type=int, default=3,
+                        help='Number of questions to include in each prompt (default: 3)')
+    parser.add_argument('--sample_fraction', type=float, default=0.2,
+                        help='Fraction of YOLOv10 detection images to include (default: 0.2 or 1/5th)')
+    parser.add_argument('--format', type=str, default='ollama',
+                        choices=['ollama', 'lmstudio',
+                                 'anthropic', 'openai', 'generic'],
+                        help='Format type for the prompt (default: ollama)')
+    parser.add_argument('--videos', type=str, nargs='+',
+                        help='Specific video IDs to process (optional)')
+
+    args = parser.parse_args()
+
+    # Create output directory if it doesn't exist
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Get list of videos to process
+    if args.videos:
+        video_ids = args.videos
+    else:
+        # Use all videos that have data in all required directories
+        tracking_videos = set(os.listdir(args.tracking_dir))
+        yolo_videos = set(os.listdir(args.yolo_dir))
+        vis_videos = set(os.listdir(args.vis_dir))
+
+        # Find intersection of videos present in all directories
+        video_ids = list(tracking_videos.intersection(yolo_videos, vis_videos))
+
+    print(f"Found {len(video_ids)} videos to process")
+
+    # Process each video
+    for video_id in video_ids:
+        print(f"Processing video: {video_id}")
+
+        # Get visualization images for this video (excluding mp4 files)
+        vis_paths = get_tracking_visualizations(args.vis_dir, video_id)
+        if not vis_paths:
+            print(
+                f"No visualization images found for video {video_id}. Skipping.")
+            continue
+
+        # Get a sample of YOLO detection images
+        detection_paths = get_yolo_detection_samples(
+            args.yolo_dir, video_id, args.sample_fraction)
+        if not detection_paths:
+            print(
+                f"No YOLOv10 detection images found for video {video_id}. Skipping.")
+            continue
+
+        # Get tracking data path
+        tracking_path = os.path.join(
+            args.tracking_dir, video_id, "tracking_summary.json")
+        if not os.path.exists(tracking_path):
+            print(f"No tracking data found for video {video_id}. Skipping.")
+            continue
+
+        # Get YOLOv10 data path
+        yolo_path = os.path.join(args.yolo_dir, video_id,
+                                 "json_detections", f"{video_id}_detections.json")
+        if not os.path.exists(yolo_path):
+            print(f"No YOLOv10 data found for video {video_id}. Skipping.")
+            continue
+
+        # Load data
+        tracking_data = load_tracking_results(tracking_path)
+        yolo_data = load_yolo_results(yolo_path)
+
+        # Get video-specific questions from metadata
+        questions = load_metadata_questions(args.metadata_file, video_id)
+        if not questions:
+            print(
+                f"No questions found in metadata for video {video_id}. Skipping.")
+            continue
+
+        # Generate prompt
+        prompt_data = generate_prompt(
+            vis_paths,
+            detection_paths,
+            tracking_data,
+            yolo_data,
+            questions,
+            args.num_questions,
+            args.format
+        )
+
+        if not prompt_data:
+            print(f"Failed to generate prompt for video {video_id}. Skipping.")
+            continue
+
+        # Save prompt to output directory
+        output_file = os.path.join(args.output_dir, f"{video_id}_prompt.json")
+
+        # Remove the base64 data for saving to reduce file size
+        save_data = prompt_data.copy()
+
+        # Replace base64 data with file references
+        save_data["visualization_references"] = vis_paths
+        save_data["detection_references"] = detection_paths
+
+        if args.format == 'ollama':
+            save_data["prompt"]["images"] = [
+                "[BASE64_IMAGE_DATA_REMOVED]"] * len(vis_paths + detection_paths)
+        elif args.format == 'lmstudio':
+            # Replace each <img> tag with a placeholder
+            content = save_data["prompt"]["messages"][1]["content"]
+            for i in range(len(vis_paths) + len(detection_paths)):
+                content = content.replace(
+                    f"<img src='data:image/jpeg;base64,{prompt_data['prompt']['messages'][1]['content'].split('base64,')[i+1].split('>')[0]}'>",
+                    f"<img src='[BASE64_IMAGE_DATA_REMOVED_{i}]'>"
+                )
+            save_data["prompt"]["messages"][1]["content"] = content
+
+        with open(output_file, 'w') as f:
+            json.dump(save_data, f, indent=2)
+
+        print(f"Saved prompt to {output_file}")
+
+    print(
+        f"Processed {len(video_ids)} videos. Prompts saved to {args.output_dir}.")
+
+
+if __name__ == "__main__":
+    main()

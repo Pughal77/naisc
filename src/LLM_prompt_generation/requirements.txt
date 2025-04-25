@@ -1,0 +1,8 @@
+requests>=2.28.0
+pillow>=9.2.0
+pandas>=1.4.0
+matplotlib>=3.5.0
+tqdm>=4.64.0
+python-dotenv>=0.21.0
+base64io>=1.0.3
+argparse>=1.4.0 
